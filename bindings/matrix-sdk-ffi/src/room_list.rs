@@ -502,6 +502,8 @@ pub enum RoomListEntriesDynamicFilterKind {
     All { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Any { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Identifiers { identifiers: Vec<String> },
+    // NonIdentifiers is a flat stand-in for `Not { Identifiers }`, see below.
+    NonIdentifiers { identifiers: Vec<String> },
     NonSpace,
     Space,
     NonLeft,
@@ -535,6 +537,11 @@ impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
             Kind::Identifiers { identifiers } => Box::new(new_filter_identifiers(
                 identifiers.into_iter().map(|id| RoomId::parse(id).unwrap()).collect(),
             )),
+            Kind::NonIdentifiers { identifiers } => {
+                Box::new(new_filter_not(Box::new(new_filter_identifiers(
+                    identifiers.into_iter().map(|id| RoomId::parse(id).unwrap()).collect(),
+                ))))
+            }
             Kind::NonSpace => Box::new(new_filter_not(Box::new(new_filter_space()))),
             Kind::Space => Box::new(new_filter_space()),
             Kind::NonLeft => Box::new(new_filter_non_left()),

@@ -95,8 +95,8 @@ use ruma::{
         error::ErrorKind,
     },
     events::{
-        AnyMessageLikeEventContent, AnySyncTimelineEvent, AnyToDeviceEventContent,
-        GlobalAccountDataEvent as RumaGlobalAccountDataEvent,
+        AnyGlobalAccountDataEvent, AnyMessageLikeEventContent, AnySyncTimelineEvent,
+        AnyToDeviceEventContent, GlobalAccountDataEvent as RumaGlobalAccountDataEvent,
         RoomAccountDataEvent as RumaRoomAccountDataEvent, RoomAccountDataEventType,
         ToDeviceEventType,
         direct::DirectEventContent,
@@ -152,7 +152,8 @@ use crate::{
     room_preview::RoomPreview,
     ruma::{
         AccountDataEvent, AccountDataEventType, AuthData, InviteAvatars, MediaPreviewConfig,
-        MediaPreviews, MediaSource, PresenceState, RoomAccountDataEvent, UserCall, UserStatus,
+        MediaPreviews, MediaSource, PresenceState, RoomAccountDataEvent, TagInfo, UserCall,
+        UserStatus,
     },
     runtime::get_runtime_handle,
     spaces::SpaceService,
@@ -318,6 +319,22 @@ impl From<matrix_sdk::encryption::DuplicateOneTimeKeyErrorMessage>
 pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called when a room account data event was changed.
     fn on_change(&self, event: RoomAccountDataEvent, room_id: String);
+}
+
+/// A listener for changes of the tags of any room.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait RoomTagsListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called with every tag of the room, keyed by raw tag name, each time the
+    /// `m.tag` room account data of that room changes.
+    fn on_change(&self, room_id: String, tags: HashMap<String, TagInfo>);
+}
+
+/// A listener for changes of one global account data event type, given as
+/// raw JSON so that types the SDK does not model can be observed too.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait RawAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called with the new `content` of the event, as a JSON string.
+    fn on_change(&self, content: String);
 }
 
 /// A listener for notifications generated from sync responses.
@@ -1089,6 +1106,73 @@ impl Client {
                 })
             }
         }
+    }
+
+    /// Subscribe to the tags of every room, with raw tag names.
+    ///
+    /// Unlike [`Client::observe_room_account_data_event`], this needs a
+    /// single subscription for all rooms, and keeps tags outside of the
+    /// `m.*` and `u.*` namespaces instead of dropping the whole event.
+    /// Only changes received after subscribing are reported; use
+    /// `Room::tags` for the current tags.
+    pub fn observe_room_tags(&self, listener: Box<dyn RoomTagsListener>) -> Arc<TaskHandle> {
+        // Using an Arc here is mandatory or else the subscriber will never trigger
+        let observer = Arc::new(
+            self.inner
+                .observe_events::<RumaRoomAccountDataEvent<TagEventContent>, matrix_sdk::Room>(),
+        );
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            let mut subscriber = observer.subscribe();
+            while let Some((event, room)) = subscriber.next().await {
+                let tags = event
+                    .content
+                    .tags
+                    .into_iter()
+                    .map(|(tag_name, tag_info)| (tag_name.to_string(), tag_info.into()))
+                    .collect();
+                listener.on_change(room.room_id().to_string(), tags);
+            }
+        })))
+    }
+
+    /// Subscribe to changes of the global account data event of the given
+    /// type, including types the SDK does not model such as
+    /// `im.vector.web.settings`.
+    ///
+    /// Only changes received after subscribing are reported; use
+    /// [`Client::account_data`] for the current content.
+    pub fn observe_raw_account_data(
+        &self,
+        event_type: String,
+        listener: Box<dyn RawAccountDataListener>,
+    ) -> Arc<TaskHandle> {
+        #[derive(Deserialize)]
+        struct EventTypeAndContent {
+            #[serde(rename = "type")]
+            event_type: String,
+            content: Box<RawJsonValue>,
+        }
+
+        // Using an Arc here is mandatory or else the subscriber will never trigger
+        let observer = Arc::new(self.inner.observe_events::<Raw<AnyGlobalAccountDataEvent>, ()>());
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            let mut subscriber = observer.subscribe();
+            while let Some((raw_event, ())) = subscriber.next().await {
+                match serde_json::from_str::<EventTypeAndContent>(raw_event.json().get()) {
+                    Ok(parsed) if parsed.event_type == event_type => {
+                        listener.on_change(parsed.content.get().to_owned());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(
+                            "Ignoring global account data event without type or content: {error}"
+                        );
+                    }
+                }
+            }
+        })))
     }
 
     /// Register a handler for notifications generated from sync responses.

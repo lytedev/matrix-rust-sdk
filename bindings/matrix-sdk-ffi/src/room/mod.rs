@@ -46,6 +46,7 @@ use ruma::{
             history_visibility::HistoryVisibility as RumaHistoryVisibility,
             join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation,
         },
+        tag::{TagInfo as RumaTagInfo, TagName as RumaTagName},
     },
 };
 use serde::Deserialize;
@@ -67,7 +68,8 @@ use crate::{
     room_member::{RoomMember, RoomMemberWithSenderInfo},
     room_preview::RoomPreview,
     ruma::{
-        AudioInfo, FileInfo, ImageInfo, MediaSource, ThumbnailInfo, UserCall, UserStatus, VideoInfo,
+        AudioInfo, FileInfo, ImageInfo, MediaSource, TagInfo, ThumbnailInfo, UserCall, UserStatus,
+        VideoInfo,
     },
     runtime::get_runtime_handle,
     timeline::{
@@ -450,6 +452,34 @@ impl Room {
         tag_order: Option<f64>,
     ) -> Result<(), ClientError> {
         self.inner.set_is_low_priority(is_low_priority, tag_order).await?;
+        Ok(())
+    }
+
+    /// Get every tag of this room, keyed by the raw tag name.
+    ///
+    /// Unlike [`crate::ruma::TagName`], raw names keep tags outside of the
+    /// `m.*` and `u.*` namespaces, such as the `element.io.section.*` tags
+    /// that Element Web uses for custom room list sections.
+    pub async fn tags(&self) -> Result<HashMap<String, TagInfo>, ClientError> {
+        let tags = self.inner.tags().await?.unwrap_or_default();
+        Ok(tags
+            .into_iter()
+            .map(|(tag_name, tag_info)| (tag_name.to_string(), tag_info.into()))
+            .collect())
+    }
+
+    /// Add the tag with the given raw name to this room, or update its
+    /// order if the room already has it.
+    pub async fn set_tag(&self, tag: String, tag_info: TagInfo) -> Result<(), ClientError> {
+        let mut ruma_tag_info = RumaTagInfo::new();
+        ruma_tag_info.order = tag_info.order;
+        self.inner.set_tag(RumaTagName::from(tag), ruma_tag_info).await?;
+        Ok(())
+    }
+
+    /// Remove the tag with the given raw name from this room.
+    pub async fn remove_tag(&self, tag: String) -> Result<(), ClientError> {
+        self.inner.remove_tag(RumaTagName::from(tag)).await?;
         Ok(())
     }
 
