@@ -1180,6 +1180,78 @@ async fn test_mark_as_read() {
 }
 
 #[async_test]
+async fn test_mark_as_read_clears_stale_counts_already_covered_by_the_receipt() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room
+        .timeline_builder()
+        .with_focus(TimelineFocus::Live { hide_threaded_events: false })
+        .build()
+        .await
+        .unwrap();
+
+    let latest_event_id = event_id!("$latest_event_id");
+    let f = EventFactory::new();
+    let own_user_id = client.user_id().unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("@me look at this")
+                        .sender(user_id!("@bot:example.org"))
+                        .event_id(latest_event_id),
+                )
+                .add_receipt(
+                    f.read_receipts()
+                        .add(
+                            latest_event_id,
+                            own_user_id,
+                            EventReceiptType::Read,
+                            ReceiptThread::Unthreaded,
+                        )
+                        .into_event(),
+                ),
+        )
+        .await;
+
+    // Given client-side counts that went stale, as seen in a room full of edits
+    // where the homeserver reported nothing unread while the client counted two
+    // notifications including a mention,
+    room.update_and_save_room_info(|mut room_info| {
+        let mut read_receipts = room_info.read_receipts().clone();
+        read_receipts.num_unread = 2;
+        read_receipts.num_notifications = 2;
+        read_receipts.num_mentions = 1;
+        room_info.set_read_receipts(read_receipts);
+        (room_info, Default::default())
+    })
+    .await
+    .unwrap();
+
+    // When the user marks the room as read, no receipt is sent (the mock server
+    // has no receipt endpoint, so sending one would fail), as the existing one
+    // already covers the latest event,
+    let has_sent = timeline.mark_as_read(CreateReceiptType::Read).await.unwrap();
+    assert!(has_sent.not(), "the receipt already covers the latest event, so none must be sent");
+
+    // But the stale counts are cleared, as nothing else would ever recompute them.
+    let read_receipts = room.read_receipts();
+    assert_eq!(
+        (read_receipts.num_unread, read_receipts.num_notifications, read_receipts.num_mentions),
+        (0, 0, 0),
+        "marking the room as read must leave no unread message, notification or mention, \
+         but the counts were {read_receipts:?}"
+    );
+}
+
+#[async_test]
 async fn test_mark_as_read_after_own_reply() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;

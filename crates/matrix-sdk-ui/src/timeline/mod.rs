@@ -38,6 +38,7 @@ use matrix_sdk::{
     send_queue::{RoomSendQueueError, SendHandle},
     task_monitor::BackgroundTaskHandle,
 };
+use matrix_sdk_base::RoomInfoNotableUpdateReasons;
 use mime::Mime;
 use ruma::{
     EventId, OwnedEventId, OwnedTransactionId, UserId,
@@ -975,6 +976,10 @@ impl Timeline {
                 if thread == ReceiptThread::Unthreaded {
                     // Unset the read marker.
                     self.room().set_unread_flag(false).await?;
+
+                    if is_marking_room_as_read {
+                        self.clear_unread_counts_covered_by_the_existing_receipt().await?;
+                    }
                 }
 
                 return Ok(false);
@@ -984,6 +989,41 @@ impl Timeline {
         trace!("sending receipt");
         self.room().send_single_receipt(receipt_type, thread, event_id).await?;
         Ok(true)
+    }
+
+    /// When the user's receipt already covers the latest event, the room is
+    /// read, but the unread counts computed client-side can still be stale:
+    /// they are only recomputed when a newer receipt or new events arrive, so
+    /// nothing would ever clear them. This was seen in a room where most events
+    /// are edits, with the homeserver reporting no notification while the
+    /// client kept counting two, including a mention.
+    async fn clear_unread_counts_covered_by_the_existing_receipt(&self) -> Result<()> {
+        let room_info = self.room().clone_info();
+        let read_receipts = room_info.read_receipts();
+        let has_stale_unread_counts = read_receipts.num_unread != 0
+            || read_receipts.num_notifications != 0
+            || read_receipts.num_mentions != 0;
+        if !has_stale_unread_counts {
+            return Ok(());
+        }
+
+        trace!(
+            num_unread = read_receipts.num_unread,
+            num_notifications = read_receipts.num_notifications,
+            num_mentions = read_receipts.num_mentions,
+            "clearing unread counts the existing receipt already covers"
+        );
+        self.room()
+            .update_and_save_room_info(|mut room_info| {
+                let mut read_receipts = room_info.read_receipts().clone();
+                read_receipts.num_unread = 0;
+                read_receipts.num_notifications = 0;
+                read_receipts.num_mentions = 0;
+                room_info.set_read_receipts(read_receipts);
+                (room_info, RoomInfoNotableUpdateReasons::READ_RECEIPT)
+            })
+            .await?;
+        Ok(())
     }
 
     /// Send the given receipts.
